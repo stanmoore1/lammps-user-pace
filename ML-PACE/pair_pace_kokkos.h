@@ -81,12 +81,45 @@ class PairPACEKokkos : public PairPACE {
   NonDupScatterView<F_FLOAT*[3], typename DAT::t_f_array::array_layout> ndup_f;
   NonDupScatterView<F_FLOAT*[6], typename DAT::t_virial_array::array_layout> ndup_vatom;
 
-  friend void pair_virial_fdotr_compute<PairSNAPKokkos>(PairSNAPKokkos*);
+  friend void pair_virial_fdotr_compute<PairPACEKokkos>(PairPACEKokkos*);
 
   virtual void allocate();
 
-  double **scale;
-  bool recursive;    // "recursive" option for ACERecursiveEvaluator
+  typedef Kokkos::View<int*, DeviceType> t_ace_1i;
+  typedef Kokkos::View<double*, DeviceType> t_ace_1d;
+  typedef Kokkos::View<complex*, DeviceType> t_ace_1c;
+  typedef Kokkos::View<double**, DeviceType> t_ace_2d;
+  typedef Kokkos::View<double*[3], DeviceType> t_ace_2d3;
+  typedef Kokkos::View<complex****, DeviceType> t_ace_4c;
+  typedef Kokkos::View<complex***[3], DeviceType> t_ace_4c3;
+
+  t_ace_2d A_rank1; ///< 2D-array for storing A's for rank=1, shape: A(mu_j,n)
+  t_ace_4c A; ///< 4D array with (l,m) last indices  for storing A's for rank>1: A(mu_j, n, l, m)
+
+  t_ace_1d rhos; ///< densities \f$ \rho^{(p)} \f$(ndensity), p  = 0 .. ndensity-1
+  t_ace_1d dF_drho; ///< derivatives of cluster functional wrt. densities, index = 0 .. ndensity-1
+
+ // Spherical Harmonics
+
+  void pre_compute_harmonics();
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_barplm(double rz, int lmaxi);
+
+  KOKKOS_INLINE_FUNCTION
+  void compute_ylm(double rx, double ry, double rz, int lmaxi);
+
+  t_ace_1d alm;
+  t_ace_1d blm;
+  t_ace_1d cl;
+  t_ace_1d dl;
+
+  t_ace_3d plm;
+  t_ace_3d dplm;
+
+  t_ace_3c ylm;
+  t_ace_3c3 dylm;
+
 };
 }    // namespace LAMMPS_NS
 
