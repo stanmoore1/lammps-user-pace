@@ -24,25 +24,33 @@
 #include "error.h"
 #include "force.h"
 #include "kokkos.h"
+#include "math_const.h"
 #include "memory_kokkos.h"
 #include "neighbor_kokkos.h"
 #include "neigh_request.h"
 
-#include "ace_abstract_basis.h"
+#include "ace_c_basis.h"
+#include "ace_evaluator.h"
+#include "ace_recursive.h"
+#include "ace_version.h"
+
+namespace LAMMPS_NS {
+struct ACEImpl {
+  ACEImpl() : basis_set(nullptr), ace(nullptr) {}
+  ~ACEImpl()
+  {
+    delete basis_set;
+    delete ace;
+  }
+  ACECTildeBasisSet *basis_set;
+  ACERecursiveEvaluator *ace;
+};
+}    // namespace LAMMPS_NS
 
 using namespace LAMMPS_NS;
 using namespace MathConst;
 
 enum{FS,FS_SHIFTEDSCALED};
-
-const double sq1o4pi = 0.28209479177387814347; // sqrt(1/(4*pi))
-const double sq4pi = 3.54490770181103176384; // sqrt(4*pi)
-const double sq3 = 1.73205080756887719318; //sqrt(3), numpy
-const double sq3o2 = 1.22474487139158894067; //sqrt(3/2), numpy
-
-//definition of common factor for spherical harmonics = Y00
-//const double Y00 = sq1o4pi;
-const double Y00 = 1;
 
 /* ---------------------------------------------------------------------- */
 
@@ -76,9 +84,9 @@ PairPACEKokkos<DeviceType>::~PairPACEKokkos()
 
   for (int i = 0; i < nelements; i++) {
     for (int j = 0; j < nelements; j++) {
-      splines_gk(i, j).h_view.deallocate();
-      splines_rnl(i, j).h_view.deallocate();
-      splines_hc(i, j).h_view.deallocate();
+      k_splines_gk(i, j).h_view.deallocate();
+      k_splines_rnl(i, j).h_view.deallocate();
+      k_splines_hc(i, j).h_view.deallocate();
     }
   }
 }
@@ -112,9 +120,11 @@ void PairPACEKokkos<DeviceType>::init() {
 template<class DeviceType>
 void PairPACEKokkos<DeviceType>::grow(int natom, int maxneigh)
 {
+  auto basis_set = aceimpl->basis_set;
+
   if (A.extent(0) < natom) {
 
-    A = t_ace_3d(Kokkos::NoInit("A"), natom, elements, nradmax + 1, lmax + 1); // collapse DLM
+    A = t_ace_3c(Kokkos::NoInit("A"), natom, elements, nradmax + 1, lmax + 1); // collapse DLM
     A_rank1 = t_ace_3d(Kokkos::NoInit("A_rank1"), natom, elements, nradbase);
 
     A_list = t_ace_2c("A_list", natom, basis_set->rankmax);
@@ -138,7 +148,7 @@ void PairPACEKokkos<DeviceType>::grow(int natom, int maxneigh)
     // radial functions
     fr = t_ace_3d("fr", natom, maxneigh, nradmax, lmax + 1);
     dfr = t_ace_3d("dfr", natom, maxneigh, nradmax, lmax + 1);
-    //gr = ?
+    gr = t_ace_3d("gr", natom, maxneigh, nradmax, lmax + 1);
     dgr = t_ace_2d("dgr", natom, maxneigh, nradbase);
 
     // hard-core repulsion
@@ -192,14 +202,14 @@ void PairPACEKokkos<DeviceType>::copy_pertype()
 
     h_E0vals(n)= basis_set->E0vals(n);
 
-    int ndensity = h_ndensity(n) = mbasis_set->ap_embedding_specifications.at(mu_i).ndensity;
+    const int ndensity = h_ndensity(n) = basis_set->map_embedding_specifications.at(n).ndensity;
     maxndensity = MAX(maxndensity, ndensity);
 
-    string npoti = map_embedding_specifications.at(mu_i).npoti;
+    string npoti = basis_set->map_embedding_specifications.at(n).npoti;
     if (npoti == "FinnisSinclair")
       h_npoti(n) = FS;
     else if (npoti == "FinnisSinclairShiftedScaled")
-      h_npoti(n) = FS_SHIFTEDSCALED
+      h_npoti(n) = FS_SHIFTEDSCALED;
   }
 
   Kokkos::deep_copy(d_total_basis_size_rank1, h_total_basis_size_rank1);
@@ -210,16 +220,17 @@ void PairPACEKokkos<DeviceType>::copy_pertype()
   Kokkos::deep_copy(d_ndensity, h_ndensity);
   Kokkos::deep_copy(d_npoti, h_npoti);
 
-  d_wpre = t_ace_1i("wpre", nelements, maxndensity);
-  d_mexp = t_ace_1i("mexp", nelements, maxndensity);
+  d_wpre = t_ace_2d("wpre", nelements, maxndensity);
+  d_mexp = t_ace_2d("mexp", nelements, maxndensity);
 
   auto h_wpre = Kokkos::create_mirror_view(d_wpre);
   auto h_mexp = Kokkos::create_mirror_view(d_mexp);
 
   for (int n = 0; n < nelements; n++) {
+    const int ndensity = basis_set->map_embedding_specifications.at(n).ndensity;
     for (int p = 0; p < ndensity; p++) {
-      h_wpre(n, p) = basis_set->map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 0);
-      h_mexp(n, p) = basis_set->map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 1);
+      h_wpre(n, p) = basis_set->map_embedding_specifications.at(n).FS_parameters.at(p * 2 + 0);
+      h_mexp(n, p) = basis_set->map_embedding_specifications.at(n).FS_parameters.at(p * 2 + 1);
     }
   }
 
@@ -232,6 +243,8 @@ void PairPACEKokkos<DeviceType>::copy_pertype()
 template<class DeviceType>
 void PairPACEKokkos<DeviceType>::copy_splines()
 {
+  auto basis_set = aceimpl->basis_set;
+
   k_splines_gk = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_gk", nelements, nelements);
   k_splines_rnl = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_rnl", nelements, nelements);
   k_splines_hc = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_hc", nelements, nelements);
@@ -274,6 +287,7 @@ void PairPACEKokkos<DeviceType>::copy_tilde()
     // rank=1
     for (int func_rank1_ind = 0; func_rank1_ind < total_basis_size_rank1; ++func_rank1_ind) {
       ACECTildeBasisFunction *func = &basis_rank1[func_rank1_ind];
+    int ndensity = basis_set->map_embedding_specifications.at(n).ndensity;
       for (int p = 0; p < ndensity; p++)
         d_ctildes_rank1(n, func_rank1_ind, p) = func->ctilde[p];
 
@@ -308,7 +322,7 @@ void PairPACEKokkos<DeviceType>::copy_tilde()
    init specific to this pair style
 ------------------------------------------------------------------------- */
 
-template<class DeviceType
+template<class DeviceType>
 void PairPACEKokkos<DeviceType>::init_style()
 {
   if (atom->tag_enable == 0) error->all(FLERR, "Pair style PACE requires atom IDs");
@@ -1415,9 +1429,9 @@ template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::evaluate_splines(const int ii, const int jj, double r, int nradbase_c, int nradial_c, int mu_i,
                                                   int mu_j, bool calc_second_derivatives) {
-  auto &spline_gk = splines_gk(mu_i, mu_j);
-  auto &spline_rnl = splines_rnl(mu_i, mu_j);
-  auto &spline_hc = splines_hc(mu_i, mu_j);
+  auto &spline_gk = k_splines_gk.view<DeviceType>(mu_i, mu_j);
+  auto &spline_rnl = k_splines_rnl.view<DeviceType>(mu_i, mu_j);
+  auto &spline_hc = k_splines_hc.view<DeviceType>(mu_i, mu_j);
 
   spline_gk.calcSplines(r, calc_second_derivatives); // populate splines_gk.values, splines_gk.derivatives;
   for (int nr = 0; nr < nradbase_c; nr++) {

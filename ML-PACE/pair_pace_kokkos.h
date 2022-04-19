@@ -13,13 +13,9 @@
 
 #ifdef PAIR_CLASS
 // clang-format off
-PairStyle(pace/kk,PairPACEKokkosDevice<LMPDeviceType>);
-PairStyle(pace/kk/device,PairPACEKokkosDevice<LMPDeviceType>);
-#ifdef LMP_KOKKOS_GPU
-PairStyle(pace/kk/host,PairPACEKokkosHost<LMPHostType>);
-#else
-PairStyle(pace/kk/host,PairPACEKokkosDevice<LMPHostType>);
-#endif
+PairStyle(pace/kk,PairPACEKokkos<LMPDeviceType>);
+PairStyle(pace/kk/device,PairPACEKokkos<LMPDeviceType>);
+PairStyle(pace/kk/host,PairPACEKokkos<LMPHostType>);
 // clang-format on
 #else
 
@@ -28,12 +24,13 @@ PairStyle(pace/kk/host,PairPACEKokkosDevice<LMPHostType>);
 #define LMP_PAIR_PACE_KOKKOS_H
 
 #include "pair_pace.h"
+#include "ace_radial.h"
 #include "kokkos_type.h"
-#include "neigh_list_kokkos.h"
 #include "pair_kokkos.h"
 
 namespace LAMMPS_NS {
 
+template<class DeviceType>
 class PairPACEKokkos : public PairPACE {
  public:
 
@@ -52,6 +49,7 @@ class PairPACEKokkos : public PairPACE {
   typedef DeviceType device_type;
   typedef ArrayTypes<DeviceType> AT;
   typedef EV_FLOAT value_type;
+  using complex = SNAComplex<double>;
 
   PairPACEKokkos(class LAMMPS *);
   ~PairPACEKokkos() override;
@@ -95,7 +93,8 @@ class PairPACEKokkos : public PairPACE {
   void operator() (TagPairPACEComputeForce<NEIGHFLAG,EVFLAG>,const int& ii, EV_FLOAT&) const;
 
  protected:
-  struct ACEImpl *aceimpl;
+  int host_flag;
+  int nelements, lmax, nradmax, nradbase;
 
   typename AT::t_neighbors_2d d_neighbors;
   typename AT::t_int_1d_randomread d_ilist;
@@ -128,23 +127,51 @@ class PairPACEKokkos : public PairPACE {
 
   friend void pair_virial_fdotr_compute<PairPACEKokkos>(PairPACEKokkos*);
 
-  virtual void allocate();
+  void init();
+  void grow(int, int);
+  void copy_pertype();
+  void copy_splines();
+  void copy_tilde();
 
   typedef Kokkos::View<int*, DeviceType> t_ace_1i;
+  typedef Kokkos::View<int**, DeviceType> t_ace_2i;
   typedef Kokkos::View<double*, DeviceType> t_ace_1d;
-  typedef Kokkos::View<complex*, DeviceType> t_ace_1c;
   typedef Kokkos::View<double**, DeviceType> t_ace_2d;
   typedef Kokkos::View<double*[3], DeviceType> t_ace_2d3;
+  typedef Kokkos::View<double***, DeviceType> t_ace_3d;
+  typedef Kokkos::View<double**[3], DeviceType> t_ace_3d3;
+  typedef Kokkos::View<complex*, DeviceType> t_ace_1c;
+  typedef Kokkos::View<complex**, DeviceType> t_ace_2c;
+  typedef Kokkos::View<complex***, DeviceType> t_ace_3c;
+  typedef Kokkos::View<complex**[3], DeviceType> t_ace_3c3;
   typedef Kokkos::View<complex****, DeviceType> t_ace_4c;
   typedef Kokkos::View<complex***[3], DeviceType> t_ace_4c3;
 
-  t_ace_2d A_rank1; ///< 2D-array for storing A's for rank=1, shape: A(mu_j,n)
-  t_ace_4c A; ///< 4D array with (l,m) last indices  for storing A's for rank>1: A(mu_j, n, l, m)
+  t_ace_3c A;
+  t_ace_3d A_rank1;
 
-  t_ace_1d rhos; ///< densities \f$ \rho^{(p)} \f$(ndensity), p  = 0 .. ndensity-1
-  t_ace_1d dF_drho; ///< derivatives of cluster functional wrt. densities, index = 0 .. ndensity-1
+  t_ace_2c A_list;
+  t_ace_2c A_forward_prod;
+  t_ace_2c A_backward_prod;
 
- // Spherical Harmonics
+  t_ace_2c weights;
+  t_ace_2d weights_rank1;
+
+  t_ace_1d rhos;
+  t_ace_1d dF_drho;
+
+  // hard-core repulsion
+  t_ace_1d rho_core;
+  t_ace_2c dB_flatten;
+  t_ace_2d cr;
+  t_ace_2d dcr;
+
+  // radial functions
+  t_ace_3d fr;
+  t_ace_3d dfr;
+  t_ace_3d dgr;
+
+  // Spherical Harmonics
 
   void pre_compute_harmonics();
 
@@ -164,6 +191,29 @@ class PairPACEKokkos : public PairPACE {
 
   t_ace_3c ylm;
   t_ace_3c3 dylm;
+
+  // short neigh list
+  t_ace_3d3 d_rlist;
+  t_ace_2d d_distsq;
+  t_ace_2i d_nearest;
+
+  // per-type
+  t_ace_1i d_total_basis_size_rank1 = t_ace_1i("total_basis_size_rank1", nelements);
+  t_ace_1i d_total_basis_size;
+  t_ace_1i d_ndensity;
+  t_ace_1i d_npoti;
+  t_ace_1d d_rho_core_cutoff;
+  t_ace_1d d_drho_core_cutoff;
+  t_ace_1d d_E0vals;
+  t_ace_2d d_wpre;
+  t_ace_2d d_mexp;
+
+  // tilde
+  t_ace_2d d_rank;
+  t_ace_3d d_mus;
+  t_ace_3d d_ns;
+  t_ace_3d d_ls;
+  t_ace_3d d_ms;
 
   class SplineInterpolatorKokkos {
    public:
@@ -199,15 +249,15 @@ class PairPACEKokkos : public PairPACE {
 
     void deallocate() {
       values = t_ace_1d();
-      derivative = t_ace_1d();
+      derivatives = t_ace_1d();
       second_derivatives = t_ace_1d();
       lookupTable = t_ace_3d4();
     }
   };
 
-  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_gk_kk;
-  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_rnl_kk;
-  Kokkos::DuaolView<SplineInterpolatorKokkos**, DeviceType> k_splines_hc_kk;
+  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_gk;
+  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_rnl;
+  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_hc;
 
 };
 }    // namespace LAMMPS_NS
