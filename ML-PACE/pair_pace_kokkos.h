@@ -36,6 +36,19 @@ namespace LAMMPS_NS {
 
 class PairPACEKokkos : public PairPACE {
  public:
+
+  struct TagPairPACEComputeNeigh{};
+  struct TagPairPACEComputeRadial{};
+  struct TagPairPACEComputeYlm{};
+  struct TagPairPACEComputeAi{};
+  struct TagPairPACEConjugateAi{};
+  struct TagPairPACEComputeWeights{};
+  struct TagPairPACEComputeRho{};
+  struct TagPairPACEComputeFS;
+
+  template<int NEIGHFLAG, int EVFLAG>
+  struct TagPairPACEComputeForce{};
+
   typedef DeviceType device_type;
   typedef ArrayTypes<DeviceType> AT;
   typedef EV_FLOAT value_type;
@@ -48,6 +61,38 @@ class PairPACEKokkos : public PairPACE {
   void coeff(int, char **) override;
   void init_style() override;
   double init_one(int, int) override;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeNeigh,const typename Kokkos::TeamPolicy<DeviceType, TagPairPACEComputeNeigh>::member_type& team) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeRadial,const typename Kokkos::TeamPolicy<DeviceType, TagPairPACEComputeRadial>::member_type& team) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeYlm,const typename Kokkos::TeamPolicy<DeviceType, TagPairPACEComputeYlm>::member_type& team) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeAi,const typename Kokkos::TeamPolicy<DeviceType, TagPairPACEComputeAi>::member_type& team) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEConjugateAi,const int& ii) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeRho,const int& ii) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeFS,const int& ii) const;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeWeights,const int& ii) const;
+
+  template<int NEIGHFLAG, int EVFLAG>
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeForce<NEIGHFLAG,EVFLAG>,const int& ii) const;
+
+  template<int NEIGHFLAG, int EVFLAG>
+  KOKKOS_INLINE_FUNCTION
+  void operator() (TagPairPACEComputeForce<NEIGHFLAG,EVFLAG>,const int& ii, EV_FLOAT&) const;
 
  protected:
   struct ACEImpl *aceimpl;
@@ -119,6 +164,50 @@ class PairPACEKokkos : public PairPACE {
 
   t_ace_3c ylm;
   t_ace_3c3 dylm;
+
+  class SplineInterpolatorKokkos {
+   public:
+    int ntot, nlut, num_of_functions;
+    double cutoff, deltaSplineBins, invrscalelookup, rscalelookup;
+
+    t_ace_1d values, derivatives, second_derivatives;
+
+    typedef Kokkos::View<double**[4], DeviceType> t_ace_3d4;
+    t_ace_3d4 lookupTable;
+
+    void operator=(const SplineInterpolator &spline) {
+      cutoff = spline.cutoff;
+      deltaSplineBins = spline.deltaSplineBins;
+      ntot = spline.ntot;
+      nlut = spline.nlut;
+      invrscalelookup = spline.invrscalelookup;
+      rscalelookup = spline.rscalelookup;
+      num_of_functions = spline.num_of_functions;
+
+      values = t_ace_1d("values", num_of_functions);
+      derivatives = t_ace_1d("derivatives", num_of_functions);
+      second_derivatives = t_ace_1d("second_derivatives", num_of_functions);
+
+      lookupTable = t_ace_3d4("lookupTable", ntot+1, num_of_functions);
+      auto h_lookupTable = Kokkos::create_mirror_view(lookupTable);
+      for (int i = 0; i < ntot+1; i++)
+        for (int j = 0; j < num_of_functions; j++)
+          for (int k = 0; k < 4; k++)
+            h_lookupTable(i, j, k) = spline.lookupTable(i, j, k);
+      Kokkos::deep_copy(lookupTable, h_lookupTable);
+    }
+
+    void deallocate() {
+      values = t_ace_1d();
+      derivative = t_ace_1d();
+      second_derivatives = t_ace_1d();
+      lookupTable = t_ace_3d4();
+    }
+  };
+
+  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_gk_kk;
+  Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType> k_splines_rnl_kk;
+  Kokkos::DuaolView<SplineInterpolatorKokkos**, DeviceType> k_splines_hc_kk;
 
 };
 }    // namespace LAMMPS_NS

@@ -33,10 +33,12 @@
 using namespace LAMMPS_NS;
 using namespace MathConst;
 
+enum{FS,FS_SHIFTEDSCALED};
+
 const double sq1o4pi = 0.28209479177387814347; // sqrt(1/(4*pi))
 const double sq4pi = 3.54490770181103176384; // sqrt(4*pi)
-const double sq3 = 1.73205080756887719318;//sqrt(3), numpy
-const double sq3o2 = 1.22474487139158894067;//sqrt(3/2), numpy
+const double sq3 = 1.73205080756887719318; //sqrt(3), numpy
+const double sq3o2 = 1.22474487139158894067; //sqrt(3/2), numpy
 
 //definition of common factor for spherical harmonics = Y00
 //const double Y00 = sq1o4pi;
@@ -44,7 +46,7 @@ const double Y00 = 1;
 
 /* ---------------------------------------------------------------------- */
 
-template<class DeviceType
+template<class DeviceType>
 PairPACEKokkos<DeviceType>::PairPACEKokkos(LAMMPS *lmp) : PairPACE(lmp)
 {
   respa_enable = 0;
@@ -62,17 +64,28 @@ PairPACEKokkos<DeviceType>::PairPACEKokkos(LAMMPS *lmp) : PairPACE(lmp)
    check if allocated, since class can be destructed when incomplete
 ------------------------------------------------------------------------- */
 
-template<class DeviceType
+template<class DeviceType>
 PairPACEKokkos<DeviceType>::~PairPACEKokkos()
 {
   if (copymode) return;
 
   memoryKK->destroy_kokkos(k_eatom,eatom);
   memoryKK->destroy_kokkos(k_vatom,vatom);
+
+  // deallocate views of views in serial to prevent issues in Kokkos tools
+
+  for (int i = 0; i < nelements; i++) {
+    for (int j = 0; j < nelements; j++) {
+      splines_gk(i, j).h_view.deallocate();
+      splines_rnl(i, j).h_view.deallocate();
+      splines_hc(i, j).h_view.deallocate();
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 void PairPACEKokkos<DeviceType>::init() {
 
   PairPACEKokkos::init();
@@ -83,11 +96,6 @@ void PairPACEKokkos<DeviceType>::init() {
   lmax = basis_set->lmax;
   nradmax = basis_set->nradmax;
   nradbase = basis_set->nradbase;
-  ndensity = basis_set->map_embedding_specifications[mu_i].ndensity; ///////// can't do this here?
-
-  // hard-core repulsion
-
-  dB_flatten = t_ace_1c(Kokkos::NoInit("dB_flatten"), basis_set->max_dB_array_size);
 
   // spherical harmonics
 
@@ -101,18 +109,31 @@ void PairPACEKokkos<DeviceType>::init() {
 
 /* ---------------------------------------------------------------------- */
 
-void PairPACEKokkos<DeviceType>::grow(int natom, int maxneigh) {
-
-  if (ylm.extent(0) < natom || ylm.extent(1) < maxneigh) {
+template<class DeviceType>
+void PairPACEKokkos<DeviceType>::grow(int natom, int maxneigh)
+{
+  if (A.extent(0) < natom) {
 
     A = t_ace_3d(Kokkos::NoInit("A"), natom, elements, nradmax + 1, lmax + 1); // collapse DLM
     A_rank1 = t_ace_3d(Kokkos::NoInit("A_rank1"), natom, elements, nradbase);
 
+    A_list = t_ace_2c("A_list", natom, basis_set->rankmax);
+    //size is +1 of max to avoid out-of-boundary array access in double-triangular scheme
+    A_forward_prod = t_ace_2c("A_forward_prod", natom, basis_set->rankmax + 1);
+    A_backward_prod = t_ace_2c("A_backward_prod", natom, basis_set->rankmax + 1);
+    
     rhos = t_ace_1d(Kokkos::NoInit("rhos"), natom, basis_set->ndensitymax + 1); // +1 density for core repulsion
     dF_drho = t_ace_1d(Kokkos::NoInit("dF_drho"), natom, basis_set->ndensitymax + 1); // +1 density for core repulsion
-
+    
     weights = t_ace_3c(Kokkos::NoInit("weights"), natom, nelements, nradmax + 1, lmax + 1); // collapse DLM
     weights_rank1 = t_ace_3d(Kokkos::NoInit("weights_rank1"), natom, nelements, nradbase);
+
+    // hard-core repulsion
+    rho_core = t_ace_1d("cr", natom);
+    dB_flatten = t_ace_2c(Kokkos::NoInit("dB_flatten"), natom, basis_set->max_dB_array_size);
+  }
+
+  if (ylm.extent(0) < natom || ylm.extent(1) < maxneigh) {
 
     // radial functions
     fr = t_ace_3d("fr", natom, maxneigh, nradmax, lmax + 1);
@@ -121,26 +142,165 @@ void PairPACEKokkos<DeviceType>::grow(int natom, int maxneigh) {
     dgr = t_ace_2d("dgr", natom, maxneigh, nradbase);
 
     // hard-core repulsion
-    rho_core = t_ace_1d("cr", natom);
     cr = t_ace_2d("cr", natom, maxneigh);
     dcr = t_ace_2d("dcr", natom, maxneigh);
-    dB_flatten = t_ace_1c(Kokkos::NoInit("dB_flatten"), basis_set->max_dB_array_size); //// move into init?
 
     // spherical harmonics
-    plm = t_ace_3d("plm", natom, neighmax, (lmax + 1) * (lmax + 1));
-    dplm = t_ace_3d("dplm", natom, neighmax, (lmax + 1) * (lmax + 1));
-    ylm = t_ace_3c("ylm", natom, neighmax, (lmax + 1) * (lmax + 1));
-    dylm = t_ace_3c3("dylm", natom, neighmax, (lmax + 1) * (lmax + 1));
+    plm = t_ace_3d("plm", natom, maxneigh, (lmax + 1) * (lmax + 1));
+    dplm = t_ace_3d("dplm", natom, maxneigh, (lmax + 1) * (lmax + 1));
+    ylm = t_ace_3c("ylm", natom, maxneigh, (lmax + 1) * (lmax + 1));
+    dylm = t_ace_3c3("dylm", natom, maxneigh, (lmax + 1) * (lmax + 1));
 
     // short neigh list
     d_rlist = t_ace_3d3("pace:rlist", natom, maxneigh);
     d_distsq = t_ace_2d("pace:distsq", natom, maxneigh);
     d_nearest = t_ace_2i("pace:nearest", natom, maxneigh);
+  }
+}
 
-    A_list = t_ace_2c("A_list", ii, basis_set->rankmax);
-    //size is +1 of max to avoid out-of-boundary array access in double-triangular scheme
-    A_forward_prod = t_ace_2c("A_forward_prod", natom, basis_set->rankmax + 1);
-    A_backward_prod = t_ace_2c("A_backward_prod", natom, basis_set->rankmax + 1);
+/* ---------------------------------------------------------------------- */
+
+template<class DeviceType>
+void PairPACEKokkos<DeviceType>::copy_pertype()
+{
+  auto basis_set = aceimpl->basis_set;
+
+  d_total_basis_size_rank1 = t_ace_1i("total_basis_size_rank1", nelements);
+  d_total_basis_size = t_ace_1i("total_basis_size", nelements);
+  d_rho_core_cutoff = t_ace_1d("rho_core_cutoff", nelements);
+  d_drho_core_cutoff = t_ace_1d("drho_core_cutoff", nelements);
+  d_E0vals = t_ace_1d("E0vals", nelements);
+  d_ndensity = t_ace_1i("ndensity", nelements);
+  d_npoti = t_ace_1i("npoti", nelements);
+
+  auto h_total_basis_size_rank1 = Kokkos::create_mirror_view(d_total_basis_size_rank1);
+  auto h_total_basis_size = Kokkos::create_mirror_view(d_total_basis_size);
+  auto h_rho_core_cutoff = Kokkos::create_mirror_view(d_rho_core_cutoff);
+  auto h_drho_core_cutoff = Kokkos::create_mirror_view(d_drho_core_cutoff);
+  auto h_E0vals = Kokkos::create_mirror_view(d_E0vals);
+  auto h_ndensity = Kokkos::create_mirror_view(d_ndensity);
+  auto h_npoti = Kokkos::create_mirror_view(d_npoti);
+
+  int maxndensity = 0;
+
+  for (int n = 0; n < nelements; n++) {
+    h_total_basis_size_rank1[n] = basis_set->total_basis_size_rank1[n];
+    h_total_basis_size[n] = basis_set->total_basis_size[n];
+
+    h_rho_core_cutoff[n] = basis_set->map_embedding_specifications.at(n).rho_core_cutoff;
+    h_drho_core_cutoff[n] = basis_set->map_embedding_specifications.at(n).drho_core_cutoff;
+
+    h_E0vals(n)= basis_set->E0vals(n);
+
+    int ndensity = h_ndensity(n) = mbasis_set->ap_embedding_specifications.at(mu_i).ndensity;
+    maxndensity = MAX(maxndensity, ndensity);
+
+    string npoti = map_embedding_specifications.at(mu_i).npoti;
+    if (npoti == "FinnisSinclair")
+      h_npoti(n) = FS;
+    else if (npoti == "FinnisSinclairShiftedScaled")
+      h_npoti(n) = FS_SHIFTEDSCALED
+  }
+
+  Kokkos::deep_copy(d_total_basis_size_rank1, h_total_basis_size_rank1);
+  Kokkos::deep_copy(d_total_basis_size, h_total_basis_size);
+  Kokkos::deep_copy(d_rho_core_cutoff, h_rho_core_cutoff);
+  Kokkos::deep_copy(d_drho_core_cutoff, h_drho_core_cutoff);
+  Kokkos::deep_copy(d_E0vals, h_E0vals);
+  Kokkos::deep_copy(d_ndensity, h_ndensity);
+  Kokkos::deep_copy(d_npoti, h_npoti);
+
+  d_wpre = t_ace_1i("wpre", nelements, maxndensity);
+  d_mexp = t_ace_1i("mexp", nelements, maxndensity);
+
+  auto h_wpre = Kokkos::create_mirror_view(d_wpre);
+  auto h_mexp = Kokkos::create_mirror_view(d_mexp);
+
+  for (int n = 0; n < nelements; n++) {
+    for (int p = 0; p < ndensity; p++) {
+      h_wpre(n, p) = basis_set->map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 0);
+      h_mexp(n, p) = basis_set->map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 1);
+    }
+  }
+
+  Kokkos::deep_copy(d_wpre, h_wpre);
+  Kokkos::deep_copy(d_mexp, h_mexp);
+}
+
+/* ---------------------------------------------------------------------- */
+
+template<class DeviceType>
+void PairPACEKokkos<DeviceType>::copy_splines()
+{
+  k_splines_gk = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_gk", nelements, nelements);
+  k_splines_rnl = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_rnl", nelements, nelements);
+  k_splines_hc = Kokkos::DualView<SplineInterpolatorKokkos**, DeviceType>("splines_hc", nelements, nelements);
+
+  for (int i = 0; i < nelements; i++) {
+    for (int j = 0; j < nelements; j++) {
+      k_splines_gk(i, j).h_view = basis_set->radial_functions->splines_gk(i, j);
+      k_splines_rnl(i, j).h_view = basis_set->radial_functions->splines_rnl(i, j);
+      k_splines_hc(i, j).h_view = basis_set->radial_functions->splines_hc(i, j);
+    }
+  }
+
+  k_splines_gk.modify_host();
+  k_splines_rnl.modify_host();
+  k_splines_hc.modify_host();
+
+  k_splines_gk.sync_device();
+  k_splines_rnl.sync_device();
+  k_splines_hc.sync_device();
+}
+
+/* ---------------------------------------------------------------------- */
+
+// May be easier to make this a struct or view of views
+
+template<class DeviceType>
+void PairPACEKokkos<DeviceType>::copy_tilde()
+{
+  auto basis_set = aceimpl->basis_set;
+
+  // get max number of functions, and max rank
+
+  for (int n = 0; n < nelements; n++) {
+    const int total_basis_size_rank1 = basis_set->total_basis_size_rank1[n];
+    const int total_basis_size = basis_set->total_basis_size[n];
+
+    ACECTildeBasisFunction *basis_rank1 = basis_set->basis_rank1[n];
+    ACECTildeBasisFunction *basis = basis_set->basis[n];
+
+    // rank=1
+    for (int func_rank1_ind = 0; func_rank1_ind < total_basis_size_rank1; ++func_rank1_ind) {
+      ACECTildeBasisFunction *func = &basis_rank1[func_rank1_ind];
+      for (int p = 0; p < ndensity; p++)
+        d_ctildes_rank1(n, func_rank1_ind, p) = func->ctilde[p];
+
+    // rank > 1
+    int func_ms_ind = 0;
+    int func_ms_t_ind = 0;// index for dB
+
+    for (func_ind = 0; func_ind < total_basis_size; ++func_ind) {
+      ACECTildeBasisFunction *func = &basis[func_ind];
+      // TODO: check if func->ctildes are zero, then skip
+
+      d_rank(n, func_ind) = func->rank;
+      d_mus(n, func_ind, t) = func->mus[t]; // pointer
+      d_ns(n, func_ind, t) = func->ns[t]; // pointer
+      d_ls(n, func_ind, t) = func->ls[t]; // pointer
+
+      // loop over {ms} combinations in sum
+      for (ms_ind = 0; ms_ind < func->num_ms_combs; ++ms_ind, ++func_ms_ind) {
+        ms = &func->ms_combs[ms_ind * rank]; // current ms-combination (of length = rank)
+        d_ms(n, func_ind, ms_ind * rank) = ms;
+
+        for (int p = 0; p < ndensity; ++p) {
+          // real-part only multiplication
+          d_ctildes(n, func_ind, ms_ind * ndensity + p) = func->ctildes[ms_ind * ndensity + p];
+        }
+      }
+    }
   }
 }
 
@@ -170,7 +330,7 @@ void PairPACEKokkos<DeviceType>::init_style()
    init for one type pair i,j and corresponding j,i
 ------------------------------------------------------------------------- */
 
-template<class DeviceType
+template<class DeviceType>
 double PairPACEKokkos<DeviceType>::init_one(int i, int j)
 {
   double cutone = PairPACE::init_one(i,j);
@@ -188,7 +348,7 @@ double PairPACEKokkos<DeviceType>::init_one(int i, int j)
    set coeffs for one or more type pairs
 ------------------------------------------------------------------------- */
 
-template<class DeviceType, typename real_type, int vector_length>
+template<class DeviceType>
 void PairPACEKokkos<DeviceType, real_type, vector_length>::coeff(int narg, char **arg)
 {
   PairPACE::coeff(narg,arg);
@@ -205,7 +365,7 @@ void PairPACEKokkos<DeviceType, real_type, vector_length>::coeff(int narg, char 
 
 /* ---------------------------------------------------------------------- */
 
-template<class DeviceType
+template<class DeviceType>
 void PairPACEKokkos<DeviceType>::allocate()
 {
   PairPACE::allocate();
@@ -216,6 +376,8 @@ void PairPACEKokkos<DeviceType>::allocate()
 
   k_cutsq = tdual_fparams("PairPACEKokkos::cutsq",n,n;
   auto d_cutsq = k_cutsq.template view<DeviceType>();
+
+  copy_pertype();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -303,13 +465,6 @@ void PairPACEKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
 
   auto basis_set = aceimpl->basis_set;
 
-
-  const int total_basis_size_rank1 = basis_set->total_basis_size_rank1[mu_i];  //// need as per-type
-  const int total_basis_size = basis_set->total_basis_size[mu_i];  //// need as per-type
-
-  ACECTildeBasisFunction *basis_rank1 = basis_set->basis_rank1[mu_i]; //// need as per-type
-  ACECTildeBasisFunction *basis = basis_set->basis[mu_i]; ////
-
   double rho_cut, drho_cut, fcut, dfcut;
   double dF_drho_core;
 
@@ -379,11 +534,26 @@ void PairPACEKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
 
     //ConjugateAi
     {
-      int vector_length = vector_length_default;
-      int team_size = team_size_default;
-      check_team_size_for<TagConjugateAi>(((chunk_size+team_size-1)/team_size)*maxneigh,team_size,vector_length);
-      typename Kokkos::TeamPolicy<DeviceType, TagConjugateAi> policy_conj_ai(((chunk_size+team_size-1)/team_size)*maxneigh,team_size,vector_length);
+      typename Kokkos::RangePolicy<DeviceType,TagConjugateAi> policy_conj_ai(0,chunk_size);
       Kokkos::parallel_for("ConjugateAi",policy_conj_ai,*this);
+    }
+
+    //ComputeRho
+    { 
+      typename Kokkos::RangePolicy<DeviceType,TagComputeRho> policy_rho(0,chunk_size);
+      Kokkos::parallel_for("ComputeRho",policy_rho,*this);
+    }
+
+    //ComputeFS
+    {
+      typename Kokkos::RangePolicy<DeviceType,TagComputeFS> policy_fs(0,chunk_size);
+      Kokkos::parallel_for("ComputeFS",policy_fs,*this);
+    }
+
+    //ComputeWeights
+    {
+      typename Kokkos::RangePolicy<DeviceType,TagComputeWeights> policy_weights(0,chunk_size);
+      Kokkos::parallel_for("ComputeWeights",policy_weights,*this);
     }
 
     //ComputeForce
@@ -525,6 +695,36 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeNeigh,const typename Kokk
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
+KOKKOS_INLINE_FUNCTION
+void PairPACEKokkos<DeviceType>::operator() (TagComputeRadial, const typename Kokkos::TeamPolicy<DeviceType, TagComputeRadial>::member_type& team) const
+{
+  // Extract the atom number
+  int ii = team.team_rank() + team.team_size() * (team.league_rank() %
+           ((chunk_size+team.team_size()-1)/team.team_size()));
+  if (ii >= chunk_size) return;
+
+  // Extract the neighbor number
+  const int jj = team.league_rank() / ((chunk_size+team.team_size()-1)/team.team_size());
+  const int ncount = d_ncount(ii);
+  if (jj >= ncount) return;
+
+  const double delx = d_rlist(ii,jj,0);
+  const double dely = d_rlist(ii,jj,1);
+  const double delz = d_rlist(ii,jj,2);
+  const double rsq = d_distsq(ii,jj);
+
+  const double rinv = 1.0/sqrt(rsq);
+  const double r = rsq*rinv;
+  const double xn = delx*rinv;
+  const double yn = dely*rinv;
+  const double zn = delz*rinv;
+  evaluate_splines(ii, jj, r_norm, basis_set->nradbase, nradmx, mu_i, mu_j);
+}
+
+/* ---------------------------------------------------------------------- */
+
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::operator() (TagComputeYlm, const typename Kokkos::TeamPolicy<DeviceType, TagComputeYlm>::member_type& team) const
 {
@@ -553,6 +753,7 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeYlm, const typename Kokko
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::operator() (TagComputeAi, const typename Kokkos::TeamPolicy<DeviceType, TagComputeAi>::member_type& team) const
 {
@@ -583,7 +784,7 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeAi, const typename Kokkos
   }
 
   // hard-core repulsion
-  rho_core(ii) += cr(ii, jj); //// need device view, and atomics?
+  rho_core(ii) += cr(ii, jj); //// need atomics?
 }
 
 /* ---------------------------------------------------------------------- */
@@ -618,6 +819,8 @@ KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::operator() (TagComputeRho, const int& ii) const
 {
   const int i = d_ilist[ii + chunk_offset];
+  const int total_basis_size_rank1 = d_total_basis_size_rank1[mu_i];
+  const int total_basis_size = d_total_basis_size[mu_i];
 
   // Basis functions B with iterative product and density rho(p) calculation
   // rank=1
@@ -626,7 +829,7 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeRho, const int& ii) const
     double A_cur = A_rank1(ii, func->mus[0], func->ns[0] - 1);
     for (int p = 0; p < ndensity; ++p) {
       //for rank=1 (r=0) only 1 ms-combination exists (ms_ind=0), so index of func.ctildes is 0..ndensity-1
-      rhos(p) += func->ctildes[p] * A_cur; ////////
+      rhos(ii, p) += func->ctildes[p] * A_cur; ////////
     }
   } // end loop for rank=1
 
@@ -687,8 +890,8 @@ template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::operator() (TagComputeFS, const int& ii, EV_FLOAT &ev) const
 {
-  const double rho_cut = basis_set->map_embedding_specifications.at(mu_i).rho_core_cutoff; //// need per-type view
-  const double drho_cut = basis_set->map_embedding_specifications.at(mu_i).drho_core_cutoff; //// need per-type view
+  const double rho_cut = d_rho_core_cutoff(mu_i);
+  const double drho_cut = d_drho_core_cutoff(mu_i);
 
   inner_cutoff(rho_core(ii), rho_cut, drho_cut, fcut, dfcut);
   FS_values_and_derivatives(ii, evdwl, mu_i);
@@ -701,7 +904,7 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeFS, const int& ii, EV_FLO
   if (eflag) {
     double evdwl_cut = evdwl * fcut + rho_core(ii);
     // E0 shift 
-    evdwl_cut += basis_set->E0vals(mu_i); // need per_type view
+    evdwl_cut += d_E0vals(mu_i);
 
     //ev_tally_full(i, 2.0 * evdwl, 0.0, 0.0, 0.0, 0.0, 0.0);
     if (eflag_global) ev.evdwl += evdwl_cut;
@@ -715,6 +918,9 @@ template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::operator() (TagComputeWeights, const int& ii) const
 {
+  const int total_basis_size_rank1 = d_total_basis_size_rank1[mu_i];
+  const int total_basis_size = d_total_basis_size[mu_i];
+
   // Weights and theta calculation
 
   // rank = 1
@@ -752,7 +958,7 @@ void PairPACEKokkos<DeviceType>::operator() (TagComputeWeights, const int& ii) c
         weights(ii, mus[t], ns[t] - 1, ls[t], m_t) += theta * dB; // Theta_array(func_ms_ind);
         // update -m_t (that could also be positive), because the basis is half_basis
         weights(ii, mus[t], ns[t] - 1, ls[t], -m_t) +=
-                theta * (dB).conj() * factor; // Theta_array(func_ms_ind);
+                theta * dB.conj() * factor; // Theta_array(func_ms_ind);
       }
     }
   }
@@ -916,6 +1122,7 @@ void PairPACEKokkos<DeviceType, real_type, vector_length>::v_tally_xyz(EV_FLOAT 
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 void PairPACEKokkos<DeviceType>::pre_compute_harmonics(int lmax)
 {
   auto h_alm = Kokkos::create_mirror_view(alm);
@@ -950,6 +1157,7 @@ void PairPACEKokkos<DeviceType>::pre_compute_harmonics(int lmax)
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::compute_barplm(int ii, int jj, double rz, int lmax) const
 {
@@ -994,6 +1202,7 @@ void PairPACEKokkos<DeviceType>::compute_barplm(int ii, int jj, double rz, int l
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::compute_ylm(int ii, int jj, double rx, double ry, double rz, int lmax) const
 {
@@ -1087,6 +1296,7 @@ void PairPACEKokkos<DeviceType>::compute_ylm(int ii, int jj, double rx, double r
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::cutoff_func_poly(const double r, const double r_in, const double delta_in, double &fc, double &dfc) const
 {
@@ -1105,13 +1315,14 @@ void PairPACEKokkos<DeviceType>::cutoff_func_poly(const double r, const double r
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::Fexp(const double x, const double m, double &F, double &DF) const
 {
   const double w = 1.e6;
   const double eps = 1e-10;
 
-  const double lambda = pow(1.0 / w, m - 1.0); //// can use powint?
+  const double lambda = pow(1.0 / w, m - 1.0);
   if (abs(x) > eps) {
     double g;
     const double a = abs(x);
@@ -1135,6 +1346,7 @@ void PairPACEKokkos<DeviceType>::Fexp(const double x, const double m, double &F,
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::FexpShiftedScaled(const double rho, const double mexp, double &F, double &DF) const
 {
@@ -1157,6 +1369,7 @@ void PairPACEKokkos<DeviceType>::FexpShiftedScaled(const double rho, const doubl
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPACEKokkos<DeviceType>::inner_cutoff(const double rho_core, const double rho_cut, const double drho_cut,
                                      double &fcut, double &dfcut) const
@@ -1175,26 +1388,96 @@ void PairPACEKokkos<DeviceType>::inner_cutoff(const double rho_core, const doubl
 
 /* ---------------------------------------------------------------------- */
 
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
-void PairPACEKokkos<DeviceType>::FS_values_and_derivatives(const int ii, double &value,
-                                                  const int mu_i) const
+void PairPACEKokkos<DeviceType>::FS_values_and_derivatives(const int ii, const int mu_i) const
 {
   double F, DF = 0, wpre, mexp;
-  DENSITY_TYPE ndensity = map_embedding_specifications.at(mu_i).ndensity;
+  int npoti = d_npoti(mu_i);
+  int ndensity = d_ndensity(mu_i);
   for (int p = 0; p < ndensity; p++) {
-    wpre = map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 0);
-    mexp = map_embedding_specifications.at(mu_i).FS_parameters.at(p * 2 + 1);
-    string npoti = map_embedding_specifications.at(mu_i).npoti;
+    const double wpre = d_wpre(mu_i, p);
+    const double mexp = d_mexp(mu_i, p);
 
-    if (npoti == "FinnisSinclair")
-        Fexp(rhos(ii, p), mexp, F, DF);
-    else if (npoti == "FinnisSinclairShiftedScaled")
-        FexpShiftedScaled(rhos(ii, p), mexp, F, DF);
+    if (npoti == FS)
+      Fexp(rhos(ii, p), mexp, F, DF);
+    else if (npoti == FS_SHIFTEDSCALED)
+      FexpShiftedScaled(rhos(ii, p), mexp, F, DF);
 
-    value += F * wpre; // * weight (wpre)
-    dF_drho(ii, p) = DF * wpre;// * weight (wpre)
+    erho(ii) += F * wpre; // * weight (wpre)
+    dF_drho(ii, p) = DF * wpre; // * weight (wpre)
   }
 }
+
+/* ---------------------------------------------------------------------- */
+
+template<class DeviceType>
+KOKKOS_INLINE_FUNCTION
+void PairPACEKokkos<DeviceType>::evaluate_splines(const int ii, const int jj, double r, int nradbase_c, int nradial_c, int mu_i,
+                                                  int mu_j, bool calc_second_derivatives) {
+  auto &spline_gk = splines_gk(mu_i, mu_j);
+  auto &spline_rnl = splines_rnl(mu_i, mu_j);
+  auto &spline_hc = splines_hc(mu_i, mu_j);
+
+  spline_gk.calcSplines(r, calc_second_derivatives); // populate splines_gk.values, splines_gk.derivatives;
+  for (int nr = 0; nr < nradbase_c; nr++) {
+    gr(ii, jj, nr) = spline_gk.values(nr);
+    dgr(ii, jj, nr) = spline_gk.derivatives(nr);
+    if (calc_second_derivatives)
+      d2gr(ii, jj, nr) = spline_gk.second_derivatives(nr);
+  }
+
+  spline_rnl.calcSplines(r, calc_second_derivatives);
+  for (int ind = 0; ind < fr.extent(0); ind++) {
+    fr(ii, jj, ind) = spline_rnl.values(ind);
+    dfr(ii, jj, ind) = spline_rnl.derivatives(ind);
+    if (calc_second_derivatives)
+      d2fr(ii, jj, ind) = spline_rnl.second_derivatives(ind);
+  }
+
+  spline_hc.calcSplines(r, calc_second_derivatives);
+  cr(ii, jj) = spline_hc.values(0);
+  dcr(ii, jj) = spline_hc.derivatives(0);
+  if (calc_second_derivatives)
+    d2cr(ii, jj) = spline_hc.second_derivatives(0);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void SplineInterpolatorKokkos::calcSplines(double r, bool calc_second_derivatives) {
+  double wl, wl2, wl3, w2l1, w3l2, w4l2;
+  double c[4];
+  int func_id, idx;
+  double x = r * rscalelookup;
+  int nl = static_cast<int>(floor(x));
+
+  if (nl <= 0)
+    throw std::invalid_argument("Encountered very small distance. Stopping.");
+
+  if (nl < nlut) {
+    wl = x - double(nl);
+    wl2 = wl * wl;
+    wl3 = wl2 * wl;
+    w2l1 = 2.0 * wl;
+    w3l2 = 3.0 * wl2;
+    w4l2 = 6.0 * wl;
+    for (func_id = 0; func_id < num_of_functions; func_id++) {
+      for (idx = 0; idx <= 4; idx++)
+        c[idx] = lookupTable(nl, func_id, idx);
+      values(func_id) = c[0] + c[1] * wl + c[2] * wl2 + c[3] * wl3;
+      derivatives(func_id) = (c[1] + c[2] * w2l1 + c[3] * w3l2) * rscalelookup;
+      if (calc_second_derivatives)
+        second_derivatives(func_id) = (c[2] + c[3] * w4l2) * rscalelookup * rscalelookup * 2;
+    }
+  } else { // fill with zeroes
+    for (func_id = 0; func_id < num_of_functions; func_id++) {
+      values(func_id) = 0.0;
+      derivatives(func_id) = 0.0;
+      if (calc_second_derivatives)
+        second_derivatives(func_id) = 0.0;
+    }
+  }       
+} 
 
 /* ---------------------------------------------------------------------- */
 
